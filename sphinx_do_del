@@ -1,0 +1,148 @@
+#!/usr/bin/perl -w
+
+use strict;
+use DBI;
+use File::Path;
+
+our $sphinx_base = "/usr/local/sphinx";
+our $sphinx_bin = "$sphinx_base/bin";
+our $sphinx_data = "$sphinx_base/var/data";
+our $sphinx_etc = "$sphinx_base/etc";
+our $sphinx_search = "searchd";
+our $sphinx_indexer = "indexer";
+
+our $config_l = "$sphinx_etc/sphinx_test/sphinx_test";
+
+our %info_c = (
+         db => "ncs_web",
+         host => "localhost", 
+         user => "sphinx",
+         pass => "12345",
+      );
+
+our $idx_c="sphinx_indexes";
+our $idx_p="sphinx_counter";
+our $flag_col = "checked";
+our $flag_del = 2;
+our $id_c = "id";
+our $id_p = "tableid";
+
+sub get_db_conn {
+    my $acc_info = shift;
+    my $con_str = "DBI:mysql:database=";
+    $con_str = $con_str . $acc_info->{'db'} . ";host=" . $acc_info->{'host'};
+    return DBI->connect($con_str,$acc_info->{'user'},$acc_info->{'pass'},{'RaiseError' => 1}) or die "can not get connection: $DBI::errstr \n";
+}
+
+sub close_db_conn {
+    my $tmp = shift;
+    $tmp->disconnect();
+    print "db handle close\n";
+}
+sub sph_op {
+
+  my $flag = shift;
+
+  my $sph_start = "$sphinx_bin/$sphinx_search --config $config_l";
+  my $sph_stop = "$sph_start --stop";
+
+  my $status = `netstat -utlpn|grep 9312`;
+  if($flag==1){
+
+   print "stop server\n";
+    if($status){
+      system("$sph_stop");
+# check if stop
+      while(1){
+        my $tmp = `ps -ef|grep searchd|grep -v grep`;
+        last unless $tmp;
+        }
+    }else{
+      print "already stop\n";
+    }
+  }
+  if($flag==2){
+   print "start server\n";
+     if(!$status){
+      # test if any more index exist
+          my $index_ex = `grep "# Begin" $config_l`;
+          if($index_ex){
+             system("$sph_start");
+          }
+     }else{
+       print "already running\n";
+     }
+  }
+
+}
+
+sub sph_clean {
+
+  my $res_ref = shift;
+
+# delete from cron file
+
+ my $user = `echo \$USER`;
+ my $cron_f = "/var/spool/cron/$user";
+
+ my $start_c = "Begin index for $res_ref->{'name'}";
+ my $end_c = "End index for $res_ref->{'name'}";
+
+ `sed -i "/$start_c\$/,/$end_c\$/d" $cron_f`;
+
+# remove index data directory
+
+  my $index_d = "$sphinx_data/$res_ref->{'name'}";
+
+  if( -e $index_d && -d $index_d ){
+     rmtree("$index_d") or die("can not remove index data!\n");
+  }
+
+# remove index definition in config file
+
+   `sed -i "/$start_c\$/,/$end_c\$/d" $config_l`;
+
+# remove record from sphinx_counter
+
+  my $dbh = get_db_conn(\%info_c);
+  my $del_sql_str = "DELETE FROM $idx_p WHERE $id_p=$res_ref->{'id'}";
+  $dbh->do($del_sql_str);
+  close_db_conn($dbh);
+
+}
+
+
+
+
+my $dbh = get_db_conn(\%info_c);
+
+$dbh->do("SET NAMES UTF8");
+
+# get all record with column "checked" equal 2
+
+my $sql_str = "SELECT * FROM $idx_c WHERE $flag_col=$flag_del AND $id_c IN (SELECT $id_p FROM $idx_p)";
+my $res_ref = $dbh->selectall_hashref($sql_str,['id']);
+close_db_conn($dbh);
+
+unless(%$res_ref){
+print "没有待处理记录\n";
+exit;
+}
+
+my @keys = keys %$res_ref;
+
+# stop sphinx
+
+  sph_op(1);
+
+# for each record ,do clean operation
+
+for my $i (0..$#keys){
+
+   sph_clean($res_ref->{$keys[$i]});
+}
+
+# start sphinx
+
+sph_op(2);
+

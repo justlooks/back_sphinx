@@ -1,0 +1,398 @@
+#!/usr/bin/perl -w
+
+use strict;
+use DBI;
+use File::Copy;
+use File::Path;
+use Data::Dumper;
+
+our $sphinx_base = "/usr/local/sphinx";
+our $sphinx_bin = "$sphinx_base/bin";
+our $sphinx_etc = "$sphinx_base/etc";
+our $sphinx_data = "$sphinx_base/var/data";
+our $sphinx_search = "searchd";
+our $sphinx_indexer = "indexer";
+
+our $config_l = "$sphinx_etc/sphinx_test/sphinx_test";
+our $sample_l = "$sphinx_etc/sphinx_test/sphinx_sample";
+
+our $charset_table = 'U+FF10..U+FF19->0..9, 0..9, U+FF41..U+FF5A->a..z, U+FF21..U+FF3A->a..z, \
+A..Z->a..z, a..z, U+0149, U+017F, U+0138, U+00DF, U+00FF, U+00C0..U+00D6->U+00E0..U+00F6, \
+U+00E0..U+00F6, U+00D8..U+00DE->U+00F8..U+00FE, U+00F8..U+00FE, U+0100->U+0101, U+0101, \
+U+0102->U+0103, U+0103, U+0104->U+0105, U+0105, U+0106->U+0107, U+0107, U+0108->U+0109, \
+U+0109, U+010A->U+010B, U+010B, U+010C->U+010D, U+010D, U+010E->U+010F, U+010F, \
+U+0110->U+0111, U+0111, U+0112->U+0113, U+0113, U+0114->U+0115, U+0115, U+0116->U+0117,\
+U+0117, U+0118->U+0119, U+0119, U+011A->U+011B, U+011B, U+011C->U+011D, U+011D,\
+U+011E->U+011F, U+011F, U+0130->U+0131, U+0131, U+0132->U+0133, U+0133, U+0134->U+0135,\
+U+0135, U+0136->U+0137, U+0137, U+0139->U+013A, U+013A, U+013B->U+013C, U+013C,\
+U+013D->U+013E, U+013E, U+013F->U+0140, U+0140, U+0141->U+0142, U+0142, U+0143->U+0144,\
+U+0144, U+0145->U+0146, U+0146, U+0147->U+0148, U+0148, U+014A->U+014B, U+014B,\
+U+014C->U+014D, U+014D, U+014E->U+014F, U+014F, U+0150->U+0151, U+0151, U+0152->U+0153,\
+U+0153, U+0154->U+0155, U+0155, U+0156->U+0157, U+0157, U+0158->U+0159, U+0159,\
+U+015A->U+015B, U+015B, U+015C->U+015D, U+015D, U+015E->U+015F, U+015F, U+0160->U+0161,\
+U+0161, U+0162->U+0163, U+0163, U+0164->U+0165, U+0165, U+0166->U+0167, U+0167,\
+U+0168->U+0169, U+0169, U+016A->U+016B, U+016B, U+016C->U+016D, U+016D, U+016E->U+016F,\
+U+016F, U+0170->U+0171, U+0171, U+0172->U+0173, U+0173, U+0174->U+0175, U+0175,\
+U+0176->U+0177, U+0177, U+0178->U+00FF, U+00FF, U+0179->U+017A, U+017A, U+017B->U+017C,\
+U+017C, U+017D->U+017E, U+017E, U+4E00..U+9FFF';
+
+
+sub get_db_conn {
+    my $acc_info = shift;
+    my $con_str = "DBI:mysql:database=";
+    $con_str = $con_str . $acc_info->{'db'} . ";host=" . $acc_info->{'host'};
+    return DBI->connect($con_str,$acc_info->{'user'},$acc_info->{'pass'},{'RaiseError' => 1}) or die "can not get connection: $DBI::errstr \n";
+}
+
+sub close_db_conn {
+    my $tmp = shift;
+    $tmp->disconnect();
+    print "db handle close\n";
+}
+
+sub sph_op {
+  #my ($config_l,$flag,$sph_base) = @_;
+  my $flag = shift;
+  my $sph_start = "$sphinx_bin/$sphinx_search --config $config_l";
+  my $sph_stop = $sph_start . " --stop";
+ # my $status = `netstat -utlpn|grep 9312`;
+  my $status = `ps -ef|grep searchd|grep -v grep`;
+
+  if($flag==1){
+   print "stop server\n";
+    if($status){
+      system("$sph_stop");
+# check if stop
+      while(1){
+        my $tmp = `ps -ef|grep searchd|grep -v grep`;
+        last unless $tmp;
+	}
+    }else{
+      print "already stop\n";
+    }
+  }
+  if($flag==2){
+   print "start server\n";
+     if(!$status){
+      # test if any more index exist
+          my $index_ex = `grep "# Begin" $config_l`;
+          if($index_ex){
+             system("$sph_start");
+          }
+     }else{
+       print "already running\n";
+     }
+  }
+}
+
+sub sph_create_table {
+     my $res_ref = shift;
+
+     my $cstr='';
+     my $opt_NOTNULL=' NOT NULL';
+     my $opt_DEFAULTV=' DEFAULT \'\'';
+     my $topt=' DEFAULT CHARSET=UTF8';
+
+     for my $i (0..$#{$res_ref->{'str_arr'}}){
+         $cstr = $cstr . $res_ref->{'str_arr'}[$i] . $opt_NOTNULL . $opt_DEFAULTV . ",";
+      }
+      for my $i (0..$#{$res_ref->{'nostr_arr'}}){
+         $cstr = $cstr . $res_ref->{'nostr_arr'}[$i] . $opt_NOTNULL . ",";
+      }
+      $cstr = $cstr . $res_ref->{'key_column_name'} . " UNSIGNED " . $opt_NOTNULL . ",";
+
+     $cstr = $cstr . "id INTEGER PRIMARY KEY AUTO_INCREMENT";
+     my $cre_sql_str = "CREATE TABLE IF NOT EXISTS $res_ref->{'table_name'} ($cstr) $topt";
+     my $dbh = get_db_conn($res_ref->{'info_d'});
+print $cre_sql_str;
+     $dbh->do($cre_sql_str);
+     close_db_conn($dbh);
+
+}
+
+sub sph_write_config {
+
+     my $data_ref = shift;
+
+     if(!-e "$config_l"){
+     copy($sample_l,$config_l);
+     }
+     my $FH;
+     open($FH,">>$config_l") or die ("can not open config file!\n");
+
+     ( my $tmp = $data_ref->{'key_column_name'}) =~ s/(\S+)\s+(\S+)/$1/;
+     my $data_a = '';
+     $data_a .= $tmp;
+     if($data_ref->{'str_d'}){
+       $data_a .= ",";
+       $data_a .= $data_ref->{'str_d'};
+     }
+     if($data_ref->{'nostr_d'}){
+       $data_a .= ",";
+       $data_a .= $data_ref->{'nostr_d'};
+     }
+
+  my $dir_c = "$sphinx_data/$data_ref->{'name'}";
+  if( !-e $dir_c || !-d $dir_c ){
+      mkpath("$dir_c");
+     print "ok create $dir_c\n";
+  }else{
+      die("index $dir_c already exists!\n");
+  }
+  # print archor
+
+  print $FH ("# Begin index for $data_ref->{'name'}\n");
+
+  print $FH ("# here is the main index datasource for $data_ref->{'table_name'} used by $data_ref->{'name'}\n");
+  print $FH ("\n");
+
+  print $FH ("source $data_ref->{'main_index_name'}src {\n");
+  print $FH ("\ttype = mysql\n");
+  print $FH ("\tsql_host = $data_ref->{'info_d'}->{'host'}\n");
+  print $FH ("\tsql_user = $data_ref->{'info_d'}->{'user'}\n");
+  print $FH ("\tsql_pass = $data_ref->{'info_d'}->{'pass'}\n");
+  print $FH ("\tsql_db = $data_ref->{'info_d'}->{'db'}\n");
+  print $FH ("\tsql_port = 3306\n");
+  print $FH ("\tsql_sock = /var/lib/mysql/mysql.sock\n");
+  print $FH ("\tsql_query_pre =  SET NAMES utf8\n");
+  print $FH ("\tsql_query_pre =  SET SESSION query_cache_type=OFF\n");
+  print $FH ("\tsql_query_pre =  REPLACE INTO ncs_web.sphinx_counter SELECT \'$data_ref->{'id'}\',MAX(id) FROM $data_ref->{'table_name'}\n");
+  # judge if NULL
+  print $FH ("\tsql_query = SELECT $data_a FROM $data_ref->{'table_name'} WHERE id<=( SELECT maxid FROM ncs_web.sphinx_counter WHERE tableid=$data_ref->{'id'})\n");
+
+  for my $i (keys %{$data_ref->{'attr'}}){
+     if($i eq "int"){
+        foreach my $k ( @{$data_ref->{'attr'}->{$i}} ){
+             print $FH ("\tsql_attr_uint = $k\n");
+        }
+      }elsif($i eq "timestamp"){
+        foreach my $k ( @{$data_ref->{'attr'}->{$i}} ){
+             print $FH ("\tsql_attr_timestamp = $k\n");
+        }
+      }
+  }
+
+  print $FH ("}\n");
+  print $FH ("\n");
+  print $FH ("\n");
+
+  print $FH ("# here is the delta index datasource for $data_ref->{'table_name'} used by $data_ref->{'name'}\n");
+  print $FH ("\n");
+  print $FH ("source $data_ref->{'delta_index_name'}src : $data_ref->{'main_index_name'}src {\n");
+  print $FH ("\tsql_query_pre =  SET NAMES utf8\n");
+  print $FH ("\tsql_query_pre =  SET SESSION query_cache_type=OFF\n");
+  print $FH ("\tsql_query = SELECT $data_a FROM $data_ref->{'table_name'} WHERE id>( SELECT maxid FROM ncs_web.sphinx_counter WHERE tableid=$data_ref->{'id'})\n");
+  print $FH ("}\n");
+  print $FH ("\n");
+  print $FH ("\n");
+  print $FH ("# here is main index for $data_ref->{'table_name'} used by $data_ref->{'name'}\n");
+  print $FH ("\n");
+  print $FH ("index $data_ref->{'main_index_name'}\n");
+  print $FH ("{\n");
+  print $FH ("\tsource = $data_ref->{'main_index_name'}src\n");
+
+  #my $dir_c = "$sphinx_data/$data_ref->{'name'}";
+  #if( !-e $dir_c || !-d $dir_c ){
+  #    mkpath("$dir_c");
+   #  print "ok create $dir_c\n";
+  #}else{
+  #    die("index $dir_c already exists!\n");
+  #}
+  print $FH ("\tpath = $dir_c/$data_ref->{'main_index_name'}\n");
+  print $FH ("\tdocinfo = extern\n");
+  print $FH ("\tcharset_type = utf-8\n");
+  print $FH ("\tcharset_table = $charset_table\n");
+
+  if($data_ref->{'prefix_search'} || $data_ref->{'infix_search'}){
+    print $FH ("\tenable_star = 1\n");
+  }
+
+# check if need open prefix search
+  if($data_ref->{'prefix_search'}){
+   ($tmp = $data_ref->{'prefix_search'}) =~ s/\|/,/g;
+   print $FH ("\tprefix_fields = $tmp\n");
+
+# change "column1|column2" to "column1,column2"
+
+#  print $FH ("\tprefix_fields = $data_ref->{'prefix_search'}\n");
+   print $FH ("\tmin_prefix_len = $data_ref->{'prefix_len'}\n");
+  }
+# check if need open infix search
+  if($data_ref->{'infix_search'}){
+   ($tmp = $data_ref->{'infix_search'}) =~ s/\|/,/g;
+   print $FH ("\tinfix_fields = $tmp\n");
+
+# change "column1|column2" to "column1,column2"
+
+#  print $FH ("\tinfix_fields = $data_ref->{'infix_search'}\n");
+   print $FH ("\tmin_infix_len = $data_ref->{'infix_len'}\n");
+  }
+
+  print $FH ("}\n");
+  print $FH ("\n");
+  print $FH ("\n");
+
+  print $FH ("# here is delta index for $data_ref->{'table_name'} used by $data_ref->{'name'}\n");
+  print $FH ("\n");
+  print $FH ("index $data_ref->{'delta_index_name'} : $data_ref->{'main_index_name'}\n");
+  print $FH ("{\n");
+  print $FH ("\tsource = $data_ref->{'delta_index_name'}src\n");
+  print $FH ("\tpath = $dir_c/$data_ref->{'delta_index_name'}\n");
+  print $FH ("}\n");
+  print $FH ("\n");
+  print $FH ("\n");
+
+# print archor
+
+  print $FH ("# End index for $data_ref->{'name'}\n");
+
+}
+
+sub sph_build_index {
+     my $res_ref = shift;
+     my $sph_build_index = "$sphinx_bin/$sphinx_indexer --config $config_l $res_ref->{'main_index_name'} $res_ref->{'delta_index_name'}";
+     system("$sph_build_index");
+}
+
+sub sph_set_cron {
+
+  my $res_ref = shift;
+
+  my $user = `echo \$USER`;
+  my $cron_f = "/var/spool/cron/$user";
+  my $idx_build = "$sphinx_bin/$sphinx_indexer --rotate --config $config_l ";
+  my $idx_time_main = "* */$res_ref->{'main_index_update'} * * *";
+  my $idx_time_delta = "*/$res_ref->{'delta_index_update'} * * * *";
+  open(my $FH,">>$cron_f") or die ("can not edit cron file!\n");
+
+  print $FH ("# Begin index for $res_ref->{'name'}\n");
+  print $FH ("$idx_time_main\t$idx_build$res_ref->{'main_index_name'}\n");
+  print $FH ("$idx_time_delta\t$idx_build$res_ref->{'delta_index_name'}\n");
+  print $FH ("# End index for $res_ref->{'name'}\n");
+  close($FH);
+
+}
+
+sub str_do {
+    my $res_ref = shift;
+    my @str_t = split /\|/,$res_ref->{'full_text_search'};
+    my @nostr_t = split /\|/,$res_ref->{'exact_search'};
+
+    my %attr;
+
+    for my $k (@nostr_t){
+        my ($col,$kind) = $k =~ m/(\w+)\s+([^(]+)/o;
+        push @{$attr{$kind}},$col;
+    }
+
+    my $str_d = join ',',map { substr($_,0,index($_," ")) } @str_t;
+    #my $nostr_d = join ',',map { substr($_,1,index($_," ")) } @nostr_t;
+    my $nostr_d = join ',',map {my ($aa,$bb)=$_=~m/^\s*(\S+)\s+(\S+)$/;
+                             print "\$aa=$aa ,\$bb=$bb \n";
+                             if($bb eq "timestamp"){
+                                   $aa=~s/^\s*(\S+)\s*$/UNIX_TIMESTAMP\($1\) AS $1/o;
+                             }
+                             $aa; } @nostr_t;
+
+    my ($dip,$ddbname,$duser,$dpass) = split /:/,$res_ref->{'db_access_info'};
+     if(!$dpass){
+     $dpass='';
+     }
+     my %info_d = (
+     db => "$ddbname",
+     host => "$dip",
+     user => "$duser",
+     pass => "$dpass",
+     );
+
+    
+    my %res_out = ( %$res_ref ,"str_d"=> $str_d, "nostr_d"=> $nostr_d,"str_arr"=>\@str_t,"nostr_arr"=>\@nostr_t,"info_d"=>\%info_d,"attr"=>\%attr);
+    return \%res_out;
+
+
+}
+
+
+
+
+my $idx_c="sphinx_indexes";
+my $idx_p="sphinx_counter";
+my $flag_col="checked";
+
+
+my $flag_cre = 1;
+my $flag_del = 2;
+my $id_c = "id";
+my $id_p = "tableid";
+
+my %info_c = (
+         db => "ncs_web",
+         host => "localhost",
+         user => "sphinx",
+         pass => "12345",
+   );
+
+my $cre_c_sql = "CREATE TABLE IF NOT EXISTS $idx_c (\
+  id int(10) unsigned NOT NULL auto_increment,\
+  name varchar(20) character set utf8 NOT NULL default '',\
+  comment varchar(255) character set utf8 NOT NULL default '',\
+  time timestamp NOT NULL default '0000-00-00 00:00:00',\
+  full_text_search varchar(255) NOT NULL default '',\
+  prefix_search varchar(50) NOT NULL default '',\
+  exact_search varchar(255) NOT NULL default '',\
+  main_index_update tinyint(3) unsigned NOT NULL default '0',\
+  delta_index_update tinyint(3) unsigned NOT NULL default '0',\
+  table_name varchar(20) NOT NULL default '',\
+  main_index_name varchar(20) NOT NULL default '',\
+  delta_index_name varchar(20) NOT NULL default '',\
+  db_access_info varchar(70) NOT NULL default '',\
+  sphinx_access varchar(20) NOT NULL default 'localhost:9312',\
+  checked tinyint(3) unsigned NOT NULL default '0',\
+  key_column_name varchar(20) NOT NULL default '',\
+  person varchar(20) character set utf8 NOT NULL default '',\
+  prefix_len tinyint(3) unsigned NOT NULL default '6',\
+  PRIMARY KEY  (id)\
+) ENGINE=MyISAM AUTO_INCREMENT=9 DEFAULT CHARSET=latin1";
+
+my $cre_p_sql = "CREATE TABLE IF NOT EXISTS $idx_p (\
+  tableid int(10) unsigned NOT NULL,\
+  maxid int(10) unsigned NOT NULL default '0',\
+  PRIMARY KEY  (tableid)\
+) ENGINE=MyISAM DEFAULT CHARSET=latin1";
+
+# do init task
+
+my $dbh = get_db_conn(\%info_c);
+$dbh->do($cre_c_sql);
+$dbh->do($cre_p_sql);
+
+my $sql_str = "SELECT * FROM $idx_c WHERE $flag_col=$flag_cre AND $id_c NOT IN (SELECT $id_p FROM $idx_p)";
+my $res_ref = $dbh->selectall_hashref($sql_str,['id']);
+
+close_db_conn($dbh);
+
+unless(%$res_ref){
+print "没有待处理记录\n";
+exit;
+}
+sph_op(1);
+
+my @keys = keys %$res_ref;
+for my $i (0..$#keys){
+
+  my $new_ref = (str_do($res_ref->{$keys[$i]}));
+  sph_create_table($new_ref);    
+  sph_write_config($new_ref);
+  sph_build_index($new_ref);
+  sph_set_cron($new_ref);
+
+}
+
+sph_op(2);
+
+
+=head1 NAME
+
+sphinx_do_add - create new sphinx indexer 
+
+
